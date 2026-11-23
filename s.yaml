@@ -1,0 +1,52 @@
+# ============================================================
+# ETF 定投监控 — 阿里云函数计算 FC 部署配置
+# ============================================================
+edition: 3.0.0
+name: etf-monitor
+access: default
+
+# 服务（相当于项目分组）
+resources:
+  etf_service:
+    component: fc3
+    props:
+      region: cn-hangzhou
+      serviceName: etf-monitor-service
+      role: ""
+      logConfig: auto
+      # 函数配置
+      functionName: etf-scan
+      description: 美股 ETF 溢价率扫描 + 钉钉推送
+      runtime: python3.9
+      code: ./
+      handler: monitor.handler  # 入口函数 monitor.py → handler(event, context)
+      memorySize: 256
+      timeout: 30
+      # 环境变量（非敏感项在此配置，钉钉凭证请在 FC 控制台手动设置）
+      environmentVariables:
+        TARGET_PREMIUM: "3.0"
+        TURNOVER_BILLION: "10000"
+        TURNOVER_HEALTHY: "500"
+        # DINGTALK_TOKEN / DINGTALK_SECRET → 在 FC 控制台「环境变量」中手动填入，勿写进 yaml
+      # 定时触发器（交易日 3 次：10:00 盘中低点 / 14:00 午后低点 / 14:30 尾盘冲刺）
+      # 策略：A 股 ETF 日内走势"开盘冲高 → 10点回落 → 午后低迷 → 尾盘微升"
+      # 9:30 刚开盘溢价虚高不推送 | 10:00 企稳后第一波真实买点 | 14:00 日内低点概率最大 | 14:30 最后窗口
+      triggers:
+        - triggerName: cron-morning
+          triggerType: timer
+          triggerConfig:
+            cronExpression: "0 0 2 * * 1-5"  # UTC 2:00 = 北京时间 10:00（开盘企稳后第一买点）
+            enable: true
+            payload: ""
+        - triggerName: cron-midday
+          triggerType: timer
+          triggerConfig:
+            cronExpression: "0 0 6 * * 1-5"  # UTC 6:00 = 北京时间 14:00（午后低迷，日内低点窗口）
+            enable: true
+            payload: ""
+        - triggerName: cron-closing
+          triggerType: timer
+          triggerConfig:
+            cronExpression: "0 30 6 * * 1-5"  # UTC 6:30 = 北京时间 14:30（尾盘冲刺，30分钟窗口）
+            enable: true
+            payload: ""
