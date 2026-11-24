@@ -222,12 +222,18 @@ def parse_etf_data(raw_data: str) -> list[dict]:
       [1]  = 名称
       [3]  = 最新价
       [4]  = 今开（当日开盘价）
+      [5]  = 昨收（停牌检测关键字段：正常行情必 > 0，停牌日返回 0）
       [33] = 最高（当日最高价）
       [34] = 最低（当日最低价）
+      [36] = 成交量（手，停牌日恒为 0）
       [37] = 成交额（万元）
       [78] = NAV 基金净值（T-1 日官方净值，跨境 ETF 溢价率的标准基准）
              注意：不要与 IOPV 混淆。QDII 跨境 ETF 的 IOPV 在 A 股时段基于
              隔夜美股收盘价估算，参考价值有限；NAV 才是公认的折溢价计算基准
+
+    停牌判定（2026-11-24）：昨收/成交量/成交额三者全为 0 → 今日停牌，
+    价格冻结为停牌前最后一笔成交；etf["suspended"]=True 的标的不生成买入信号、
+    不写入历史库（复盘），报告中以 ⛔ 标注。
     """
     results = []
     lines = raw_data.split(";")
@@ -277,6 +283,18 @@ def parse_etf_data(raw_data: str) -> list[dict]:
         except (ValueError, TypeError):
             turnover = 0.0
 
+        # 昨收 [5]：停牌检测关键字段（正常行情昨收必 > 0，停牌日返回 0）
+        try:
+            prev_close = float(fields[5])
+        except (ValueError, TypeError):
+            prev_close = 0.0
+
+        # 成交量（手）[36]：停牌日恒为 0
+        try:
+            volume = float(fields[36])
+        except (ValueError, TypeError):
+            volume = 0.0
+
         # NAV 基金净值（索引 78，T-1 日官方净值；不是 IOPV，见注释）
         iopv_raw = fields[78] if len(fields) > 78 else ""
         try:
@@ -285,6 +303,11 @@ def parse_etf_data(raw_data: str) -> list[dict]:
             iopv = 0.0
         if iopv <= 0:
             iopv = price  # 兜底：无 IOPV 时用现价（溢价率 = 0）
+
+        # 停牌判定（2026-11-24 实测）：昨收/成交量/成交额全为 0 → 今日停牌，
+        # 价格冻结为停牌前最后一笔成交，不是当日真实行情
+        # （开盘瞬间量/额可为 0 但昨收必 > 0，三条件联合可准确区分）
+        suspended = prev_close <= 0 and volume <= 0 and turnover <= 0
 
         results.append({
             "code": code,
@@ -295,6 +318,7 @@ def parse_etf_data(raw_data: str) -> list[dict]:
             "low": low,
             "turnover": turnover,
             "iopv": iopv,
+            "suspended": suspended,
         })
     return results
 
@@ -458,6 +482,10 @@ def compute_buy_signal(etf: dict, premium: float, threshold: float,
     """计算单只 ETF 的买入信号与可买状态（云端告警与本机盘中报告共用）。
     返回 (信号文字, 是否可买入)。可买入信号：🔥立即下手/🟢建议买入/🟡尽快决策/✅可买入；
     不可买入时返回 ⚠️ 流动性差（流动性差）或 —。"""
+    # ── 停牌检测（2026-11-24）：停牌日价格冻结，冻结价 vs 最新净值算出的溢价是假数据，
+    #    不能生成任何买入信号（2026-11-24 实测 13/15 只停牌被误推"溢价稳·价低"）──
+    if etf.get("suspended"):
+        return ("⛔ 停牌（价格冻结）", False)
     turnover = etf.get("turnover", 0)
     _, liquidity_ok = format_turnover(turnover)
     is_buy = market_ok and premium < threshold
@@ -734,7 +762,7 @@ def _build_full_premium_table(etfs: list[dict]) -> tuple[list, str]:
         # 信号后缀：可买入附信号；流动性差提示；其余不附
         if item["buyable"]:
             suffix = f"｜{item['signal']}"
-        elif item["signal"].startswith("⚠️"):
+        elif item["signal"].startswith("⚠️") or item["signal"].startswith("⛔"):
             suffix = f"｜{item['signal']}"
         else:
             suffix = ""

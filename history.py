@@ -124,6 +124,8 @@ def record_daily(etfs: list, trade_date: str) -> int:
     conn = sqlite3.connect(DB_PATH)
     written = 0
     for etf in etfs:
+        if etf.get("suspended"):
+            continue  # 停牌日价格冻结，不是真实收盘价，不入库以免污染历史均值/分位
         pct = _premium(etf)
         if pct is None:
             continue
@@ -198,6 +200,8 @@ def _signal_with_premium_stability(etf: dict, premium: float, threshold: float,
     )
     if is_buy or not market_ok:
         return signal, is_buy
+    if etf.get("suspended"):
+        return "⛔ 停牌（价格冻结）", False  # 停牌冻结价不参与二级判断（防止覆盖 ⛔ 信号）
 
     prem_avg = s.get("prem_30")
     price_avg = s.get("price_30")
@@ -217,8 +221,8 @@ def _signal_with_premium_stability(etf: dict, premium: float, threshold: float,
 def _tier2_flag(s: dict) -> str:
     """复盘报告二级信号标记：溢价稳定（≤溢价30日均）且现价 ≤ 价格30日均。
     满足返回 ' ✅'（附在标的名后），否则返回 ''。样本 n < 2 不判断；一级（<2%）不重复标记。"""
-    if s["premium"] < BUY_PREMIUM_LINE:
-        return ""
+    if s.get("suspended") or s["premium"] < BUY_PREMIUM_LINE:
+        return ""  # 停牌冻结价不算二级信号（价格不是当日真实成交）
     prem_avg = s.get("prem_30")
     price_avg = s.get("price_30")
     if (prem_avg is None or price_avg is None
@@ -309,6 +313,7 @@ def build_stats(etfs: list) -> list:
             "premium": pct,
             "price": etf["price"],
             "iopv": etf["iopv"],
+            "suspended": etf.get("suspended", False),
         }
         # ── 连续折价天数（恐慌折价检测，2026-11-23）：今日溢价<0 + 历史连续折价天数；
         #    单日折价可能是 NAV(T-1) 滞后造成的假折价，连续 2 日+ 才视为有效恐慌信号 ──
@@ -369,9 +374,11 @@ def build_review_report(stats: list, trade_date: str, sample_days: int, market: 
     )
 
     # ── 决策摘要区（方案A）：先给结论，再给数据 ──
-    tier1 = [s for s in stats if s["premium"] < BUY_PREMIUM_LINE]          # 一级（🟢 溢价<2%）
-    tier2 = [s for s in stats if _tier2_flag(s)]                            # 二级（✅ 溢价稳·价低）
-    above_mean = [s for s in stats
+    # 统计口径只算当日可交易标的（停牌冻结价不代表真实市场，2026-11-24 起排除）
+    trading = [s for s in stats if not s.get("suspended")]
+    tier1 = [s for s in trading if s["premium"] < BUY_PREMIUM_LINE]         # 一级（🟢 溢价<2%）
+    tier2 = [s for s in trading if _tier2_flag(s)]                          # 二级（✅ 溢价稳·价低）
+    above_mean = [s for s in trading
                   if s.get("prem_30") is not None and s["premium"] > s["prem_30"]]
     if tier1:
         lines.append(f"🔴 **今日信号**：一级 {len(tier1)} 只（{_names_list(tier1)}）— 优先关注，按日低/尾盘信号下单\n")
@@ -379,14 +386,18 @@ def build_review_report(stats: list, trade_date: str, sample_days: int, market: 
         lines.append(f"🟡 **今日信号**：无一级；二级 {len(tier2)} 只（{_names_list(tier2)}）— 溢价稳·价低，可小仓关注\n")
     else:
         lines.append("⚪ **今日信号**：无买入信号（无溢价<2%，也无溢价稳·价低标的）\n")
-    lines.append(f"📋 **定投档位**：{dca_pacing_label(stats, len(tier1))}\n")
+    suspended_n = len(stats) - len(trading)
+    if suspended_n:
+        lines.append(f"⛔ **停牌提示**：今日 {suspended_n} 只停牌（价格冻结无法交易，已排除出信号与统计）\n")
+    lines.append(f"📋 **定投档位**：{dca_pacing_label(trading, len(tier1))}\n")
     n_rich = len(above_mean)
-    if n_rich > len(stats) - n_rich:
-        lines.append(f"💰 **整体贵贱**：{n_rich}/{len(stats)} 只溢价高于自身30日均，整体偏贵，追高需谨慎\n")
-    elif n_rich < len(stats) - n_rich:
-        lines.append(f"💰 **整体贵贱**：{n_rich}/{len(stats)} 只溢价高于自身30日均，整体偏便宜\n")
-    else:
-        lines.append(f"💰 **整体贵贱**：{n_rich}/{len(stats)} 只溢价高于自身30日均，多空均衡\n")
+    if trading:
+        if n_rich > len(trading) - n_rich:
+            lines.append(f"💰 **整体贵贱**：{n_rich}/{len(trading)} 只溢价高于自身30日均，整体偏贵，追高需谨慎\n")
+        elif n_rich < len(trading) - n_rich:
+            lines.append(f"💰 **整体贵贱**：{n_rich}/{len(trading)} 只溢价高于自身30日均，整体偏便宜\n")
+        else:
+            lines.append(f"💰 **整体贵贱**：{n_rich}/{len(trading)} 只溢价高于自身30日均，多空均衡\n")
     if market:
         pos = [u for u in market if u["pctile"] is not None]
         if pos:
@@ -413,7 +424,7 @@ def build_review_report(stats: list, trade_date: str, sample_days: int, market: 
                 deepest = (u["drawdown"], advice)
         lines.append(f"📊 **市场阶段**：{'｜'.join(segs)} → {deepest[1]}\n")
     # ── 恐慌折价（2026-11-23 新增）：溢价转负 = 极端恐慌标志，历史上接近大底 ──
-    discounts = [s for s in stats if s.get("discount_days", 0) > 0]
+    discounts = [s for s in trading if s.get("discount_days", 0) > 0]
     if discounts:
         names = "、".join(f"{s['name']}(连{s['discount_days']}日)" for s in discounts[:3])
         if len(discounts) > 3:
@@ -440,8 +451,11 @@ def build_review_report(stats: list, trade_date: str, sample_days: int, market: 
     else:
         lines.append("🌐 **美股大盘与汇率**：⚠️ 获取失败（网络异常），本次未附带\n")
     for idx, s in enumerate(sorted(stats, key=lambda x: x["premium"]), 1):
-        # 🟢 = 一级（溢价率 < 2%）；✅ = 二级（溢价稳定 + 价格低位）
-        flag = "🟢" if s["premium"] < BUY_PREMIUM_LINE else _tier2_flag(s)
+        # 🟢 = 一级（溢价率 < 2%）；✅ = 二级（溢价稳定 + 价格低位）；停牌不标信号（价格冻结）
+        if s.get("suspended"):
+            flag = ""
+        else:
+            flag = "🟢" if s["premium"] < BUY_PREMIUM_LINE else _tier2_flag(s)
         price_avg = _fmt_avg(s.get("price_30"), s.get("price_30_n", 0), 30)
         hl = _price_vs_avg_str(s["price"], s)  # 现价相对价格30日均高低符号
         hl_str = f" {hl}" if hl else ""
@@ -481,9 +495,11 @@ def build_review_report(stats: list, trade_date: str, sample_days: int, market: 
         price_seg = f" (价均 {price_avg})" if price_avg != "—" else ""
         # 市场阶段标签（2026-11-23）：指数回调/深度回撤时附行尾（正常阶段为空串）
         regime_tag = regime_row_tag_for_etf(s["code"], market) if flag else ""
+        # 停牌标记（2026-11-24）：价格冻结，行尾显式标注不可交易
+        suspend_seg = "｜⛔ 停牌（价格冻结）" if s.get("suspended") else ""
         items.append(
             f"**{idx}. {flag}{s['name']}**｜溢价 {s['premium']:+.2f}%{means_seg}{pctile_seg}｜"
-            f"现价 {s['price']:.3f}{hl_str}{price_seg}{trend_str}{trend250_str}{warn_seg}{reg_seg}{regime_tag}"
+            f"现价 {s['price']:.3f}{hl_str}{price_seg}{trend_str}{trend250_str}{warn_seg}{reg_seg}{suspend_seg}{regime_tag}"
         )
     # 每股之间：空一行 + 下划线隔离区（独占段落）；钉钉 markdown 单换行会被合并成一段
     lines.append(f"\n\n{ROW_SEPARATOR}\n\n".join(items))
@@ -491,6 +507,7 @@ def build_review_report(stats: list, trade_date: str, sample_days: int, market: 
     # 图例：与上面行同款下划线隔离区分块，每条图例单独成块，清爽可读
     legend = [
         "💡 🟢=溢价<2%｜✅=二级买入（溢价未高于30日均+现价不高于价均）",
+        "⛔=今日停牌（价格冻结为停牌前最后一笔，无法交易，不计入信号/贵贱/档位统计）",
         "(均)=溢价30/60/90交易日均值（截至上一交易日，三值相同合并显示）｜(价均)=价格30日均｜▲▼=现价高/低于价均",
         "现/净=近30日趋势，250日=近一年趋势（样本≥2天才显示）｜分位=溢价近90日历史位置，≥90%标⚠️高位｜回归亏=买入后溢价收敛回30日均的亏损",
         "样本不足标(n=)｜🌐=美股大盘与汇率最新收盘，30/120/250日=较N个交易日前涨跌，分位=点位近250日历史位置，距高点=较近2.5年高点回撤",
@@ -560,7 +577,7 @@ def build_intraday_report(etfs: list, stats: list, market: list = None) -> str:
             if loss <= -REGRESSION_LOSS_MIN:
                 reg_seg = f"｜回归亏 {loss:.1f}%"
         rows.append((premium, etf, prem_avg, price_avg, hl_str, signal, is_buy,
-                     pctile, warn_seg, reg_seg))
+                     pctile, warn_seg, reg_seg, etf.get("suspended", False)))
 
     rows.sort(key=lambda item: item[0])
 
@@ -581,17 +598,23 @@ def build_intraday_report(etfs: list, stats: list, market: list = None) -> str:
         lines.append(f"🟡 **今日信号**：无一级；二级 {len(tier2)} 只（{names}）— 溢价稳·价低，可小仓关注\n")
     else:
         lines.append("⚪ **今日信号**：无买入信号\n")
-    lines.append(f"📋 **定投档位**：{dca_pacing_label(stats, len(tier1))}\n")
-    above_mean = [s for s in stats
+    # 停牌提示（2026-11-24）：停牌标的排除出信号，行尾 ⛔ 标注；统计口径只算可交易标的
+    suspended_n = sum(1 for r in rows if r[10])
+    if suspended_n:
+        lines.append(f"⛔ **停牌提示**：今日 {suspended_n} 只停牌（价格冻结无法交易，已排除出信号与统计）\n")
+    # 统计口径只算当日可交易标的（停牌冻结价不代表真实市场）
+    trading_stats = [s for s in stats if not s.get("suspended")]
+    lines.append(f"📋 **定投档位**：{dca_pacing_label(trading_stats, len(tier1))}\n")
+    above_mean = [s for s in trading_stats
                   if s.get("prem_30") is not None and s["premium"] > s["prem_30"]]
     n_rich = len(above_mean)
-    if stats:
-        if n_rich > len(stats) - n_rich:
-            lines.append(f"💰 **整体贵贱**：{n_rich}/{len(stats)} 只溢价高于自身30日均，整体偏贵，追高需谨慎\n")
-        elif n_rich < len(stats) - n_rich:
-            lines.append(f"💰 **整体贵贱**：{n_rich}/{len(stats)} 只溢价高于自身30日均，整体偏便宜\n")
+    if trading_stats:
+        if n_rich > len(trading_stats) - n_rich:
+            lines.append(f"💰 **整体贵贱**：{n_rich}/{len(trading_stats)} 只溢价高于自身30日均，整体偏贵，追高需谨慎\n")
+        elif n_rich < len(trading_stats) - n_rich:
+            lines.append(f"💰 **整体贵贱**：{n_rich}/{len(trading_stats)} 只溢价高于自身30日均，整体偏便宜\n")
         else:
-            lines.append(f"💰 **整体贵贱**：{n_rich}/{len(stats)} 只溢价高于自身30日均，多空均衡\n")
+            lines.append(f"💰 **整体贵贱**：{n_rich}/{len(trading_stats)} 只溢价高于自身30日均，多空均衡\n")
     if market:
         pos = [u for u in market if u["pctile"] is not None]
         if pos:
@@ -618,7 +641,7 @@ def build_intraday_report(etfs: list, stats: list, market: list = None) -> str:
                 deepest = (u["drawdown"], advice)
         lines.append(f"📊 **市场阶段**：{'｜'.join(segs)} → {deepest[1]}\n")
     # ── 恐慌折价（2026-11-23 新增）：溢价转负 = 极端恐慌标志，历史上接近大底 ──
-    discounts = [s for s in stats if s.get("discount_days", 0) > 0]
+    discounts = [s for s in trading_stats if s.get("discount_days", 0) > 0]
     if discounts:
         names = "、".join(f"{s['name']}(连{s['discount_days']}日)" for s in discounts[:3])
         if len(discounts) > 3:
@@ -649,11 +672,11 @@ def build_intraday_report(etfs: list, stats: list, market: list = None) -> str:
     #    每股之间空一行 + 下划线隔离区（独占段落，钉钉 markdown 单换行会被合并）──
     items = []
     for idx, (premium, etf, prem_avg, price_avg, hl_str, signal, is_buy,
-              pctile, warn_seg, reg_seg) in enumerate(rows, 1):
-        # 信号后缀：可买入附信号；流动性差提示；其余不附
+              pctile, warn_seg, reg_seg, suspended) in enumerate(rows, 1):
+        # 信号后缀：可买入附信号；流动性差/停牌提示；其余不附
         if is_buy:
             suffix = f"｜{signal}"
-        elif signal.startswith("⚠️"):
+        elif signal.startswith("⚠️") or signal.startswith("⛔"):
             suffix = f"｜{signal}"
         else:
             suffix = ""
@@ -678,6 +701,7 @@ def build_intraday_report(etfs: list, stats: list, market: list = None) -> str:
     legend = [
         "💡 红色=可买入｜一级：溢价<阈值（🔥立即下手/🟢建议买入/🟡尽快决策/✅可买入）",
         "二级：✅溢价稳·价低=溢价未高于30日均+现价不高于价均",
+        "⛔=今日停牌（价格冻结为停牌前最后一笔，无法交易，不计入信号/贵贱/档位统计）",
         "▲▼=现价高/低于价均｜分位=溢价近90日历史位置，≥90%标⚠️高位｜回归亏=买入后溢价收敛回30日均的亏损",
         "样本不足标(n=)｜🌐=美股大盘与汇率最新收盘，30/120/250日=较N个交易日前涨跌，分位=点位近250日历史位置，距高点=较近2.5年高点回撤",
         "🐻/🔻=指数深度回撤/回调（定投照常；大额加仓分批或仅定投）｜🧊=恐慌折价（溢价<0，极端恐慌标志，连2日+有效）",
@@ -727,7 +751,9 @@ def main() -> dict:
     else:
         init_db()
         written = record_daily(etfs, today_str)
-        log_event("info", run_id, "record", f"已记录 {written} 只 ETF 到历史库（日期 {today_str}）")
+        n_susp = sum(1 for e in etfs if e.get("suspended"))
+        log_event("info", run_id, "record",
+                  f"已记录 {written} 只 ETF 到历史库（日期 {today_str}），跳过停牌 {n_susp} 只")
 
     # 5. 统计 + 报告
     stats = build_stats(etfs)
